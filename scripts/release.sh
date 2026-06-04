@@ -1,340 +1,467 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# shellcheck source=./release-lib.sh
-. "$REPO_ROOT/scripts/release-lib.sh"
-CLI_DIR="$REPO_ROOT/cli"
+# ============================================================
+# release.sh — despliegue incremental para GitHub Actions
+#
+# Uso:
+#   bash scripts/release.sh <develop>
+#   ./release.sh <develop>     (tras chmod +x)
+#
+# Argumento obligatorio: selecciona el grupo de servidores de destino.
+# El workflow de GitHub Actions mapea rama → argumento y lo pasa aquí.
+# Depth se configura abajo via COMMITSDEPTH.
+#
+# Autenticación:
+#   Solo por llave SSH (sin usuario/contraseña).
+#   Cada servidor puede tener su propia llave via el 5º campo del array,
+#   que es el NOMBRE de una variable de entorno con el contenido PEM.
+#   Si el 5º campo se omite, se usa la llave global:
+#     SSH_PRIVATE_KEY        Contenido PEM (secret GH Actions). Se escribe a tmp.
+#     SSH_PRIVATE_KEY_PATH   Ruta a llave existente en disco.
+#
+# Opcional:
+#   RELEASE_CONFIG         Ruta a JSON con array "ignore". Default .vscode/sftp.json
+#
+# Diferencia con deploy.sh:
+#   - Solo commits reales del rango HEAD~DEPTH..HEAD.
+#   - Sin cambios locales ni untracked.
+#   - Sin prompts. Sin interacción.
+#   - Hosts/puertos/rutas viven en el array SERVERS de este script.
+# ============================================================
 
-channel=""
-release_date=""
-dry_run=false
-skip_verify=false
-print_version_only=false
-tag_name=""
+# ---------- Config interna (editable) ----------
+# Formato por entrada: "host|port|user|remote_path[|KEY_ENV_VAR]"
+# - Puerto y usuario son personalizables por servidor.
+# - KEY_ENV_VAR (opcional): nombre de la variable/secret que contiene
+#   el PEM para ESE servidor. Si se omite, cae a la llave global.
+#
+# El argumento posicional determina qué array se usa:
+#   develop      -> DEVELOP_SERVERS
+#   production   -> MASTER_SERVERS
+# Cualquier otro valor aborta con error.
 
-cleanup_on_exit=false
+# Servidores para rama develop (desarrollo / staging)
+DEVELOP_SERVERS=(
+  "developers.pagegear.co|19840|ec2-user|/PageGearCloud/www/html/pge/dominios/paperclip|AWS1_SSH_KEY"
+)
 
-usage() {
-  cat <<'EOF'
-Usage:
-  ./scripts/release.sh <canary|stable> [--date YYYY-MM-DD] [--dry-run] [--skip-verify] [--print-version]
+# Servidores para rama master (producción)
+MASTER_SERVERS=(
+  "cloud.pagegear.co|19840|ec2-user|/PageGearCloud/www/html/pge/dominios/paperclip|AWS1_SSH_KEY"
+)
 
-Examples:
-  ./scripts/release.sh canary
-  ./scripts/release.sh canary --date 2026-03-17 --dry-run
-  ./scripts/release.sh stable
-  ./scripts/release.sh stable --date 2026-03-17 --dry-run
-  ./scripts/release.sh stable --date 2026-03-18 --print-version
-
-Notes:
-  - Stable versions use YYYY.MDD.P, where M is the UTC month, DD is the
-    zero-padded UTC day, and P is the same-day stable patch slot.
-  - Canary releases publish YYYY.MDD.P-canary.N under the npm dist-tag
-    "canary" and create the git tag canary/vYYYY.MDD.P-canary.N.
-  - Stable releases publish YYYY.MDD.P under the npm dist-tag "latest" and
-    create the git tag vYYYY.MDD.P.
-  - Stable release notes must already exist at releases/vYYYY.MDD.P.md.
-  - The script rewrites versions temporarily and restores the working tree on
-    exit. Tags always point at the original source commit, not a generated
-    release commit.
-EOF
-}
-
-restore_publish_artifacts() {
-  if [ -f "$CLI_DIR/package.dev.json" ]; then
-    mv "$CLI_DIR/package.dev.json" "$CLI_DIR/package.json"
-  fi
-
-  rm -f "$CLI_DIR/README.md"
-  rm -rf "$REPO_ROOT/server/ui-dist"
-
-  for pkg_dir in server packages/adapters/claude-local packages/adapters/codex-local; do
-    rm -rf "$REPO_ROOT/$pkg_dir/skills"
-  done
-}
-
-cleanup_release_state() {
-  restore_publish_artifacts
-
-  tracked_changes="$(git -C "$REPO_ROOT" diff --name-only; git -C "$REPO_ROOT" diff --cached --name-only)"
-  if [ -n "$tracked_changes" ]; then
-    printf '%s\n' "$tracked_changes" | sort -u | while IFS= read -r path; do
-      [ -z "$path" ] && continue
-      git -C "$REPO_ROOT" checkout -q HEAD -- "$path" || true
-    done
-  fi
-
-  untracked_changes="$(git -C "$REPO_ROOT" ls-files --others --exclude-standard)"
-  if [ -n "$untracked_changes" ]; then
-    printf '%s\n' "$untracked_changes" | while IFS= read -r path; do
-      [ -z "$path" ] && continue
-      if [ -d "$REPO_ROOT/$path" ]; then
-        rm -rf "$REPO_ROOT/$path"
-      else
-        rm -f "$REPO_ROOT/$path"
-      fi
-    done
-  fi
-}
-
-set_cleanup_trap() {
-  cleanup_on_exit=true
-  trap cleanup_release_state EXIT
-}
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    canary|stable)
-      if [ -n "$channel" ]; then
-        release_fail "only one release channel may be provided."
-      fi
-      channel="$1"
-      ;;
-    --date)
-      shift
-      [ $# -gt 0 ] || release_fail "--date requires YYYY-MM-DD."
-      release_date="$1"
-      ;;
-    --dry-run) dry_run=true ;;
-    --skip-verify) skip_verify=true ;;
-    --print-version) print_version_only=true ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      release_fail "unexpected argument: $1"
-      ;;
-  esac
-  shift
-done
-
-[ -n "$channel" ] || {
-  usage
-  exit 1
-}
-
-PUBLISH_REMOTE="$(resolve_release_remote)"
-fetch_release_remote "$PUBLISH_REMOTE"
-
-CURRENT_BRANCH="$(git_current_branch)"
-CURRENT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-LAST_STABLE_TAG="$(get_last_stable_tag)"
-CURRENT_STABLE_VERSION="$(get_current_stable_version)"
-RELEASE_DATE="${release_date:-$(utc_date_iso)}"
-
-PUBLIC_PACKAGE_INFO="$(list_public_package_info)"
-PUBLIC_PACKAGE_NAMES=()
-while IFS= read -r package_name; do
-  [ -n "$package_name" ] || continue
-  PUBLIC_PACKAGE_NAMES+=("$package_name")
-done < <(printf '%s\n' "$PUBLIC_PACKAGE_INFO" | cut -f2)
-
-[ -n "$PUBLIC_PACKAGE_INFO" ] || release_fail "no public packages were found in the workspace."
-
-TARGET_STABLE_VERSION="$(next_stable_version "$RELEASE_DATE" "${PUBLIC_PACKAGE_NAMES[@]}")"
-TARGET_PUBLISH_VERSION="$TARGET_STABLE_VERSION"
-DIST_TAG="latest"
-
-if [ "$channel" = "canary" ]; then
-  require_on_master_branch
-  TARGET_PUBLISH_VERSION="$(next_canary_version "$TARGET_STABLE_VERSION" "${PUBLIC_PACKAGE_NAMES[@]}")"
-  DIST_TAG="canary"
-  tag_name="$(canary_tag_name "$TARGET_PUBLISH_VERSION")"
+# DEPTH se lee del env var COMMITSDEPTH (GitHub Actions secret).
+# Fallback a 1 para ejecuciones locales sin env. Se valida más abajo.
+if [[ -n "${COMMITSDEPTH:-}" ]]; then
+  DEPTH="$COMMITSDEPTH"
+  DEPTH_SOURCE="COMMITSDEPTH env"
 else
-  tag_name="$(stable_tag_name "$TARGET_STABLE_VERSION")"
+  DEPTH=1
+  DEPTH_SOURCE="fallback=1 (sin COMMITSDEPTH)"
 fi
 
-if [ "$print_version_only" = true ]; then
-  printf '%s\n' "$TARGET_PUBLISH_VERSION"
+# Exclusiones específicas de CI que se suman a las de .vscode/sftp.json.
+# Motivo: sftp.json es compartido con deploy.sh (uso local); acá van cosas
+# que SOLO release.sh (CI) debe ignorar, como metadata de GitHub Actions.
+EXTRA_IGNORE_PATTERNS=(
+  ".github/"
+  ".vscode/"
+  ".claude/"
+  "docker/"
+  "docs/"
+)
+
+# Validación de versión de rsync en el servidor remoto.
+# rsync <3.2 no crea --temp-dir/--partial-dir automáticamente; el script ya lo
+# mitiga pre-creándolos, así que esto es informativo por defecto.
+MIN_RSYNC_VERSION="3.2.0"
+AUTO_UPDATE_RSYNC=1   # 1 = intentar `sudo` update si la versión es vieja
+# ------------------------------------------------
+
+ts()   { date '+%H:%M:%S'; }
+log()  { printf '[release %s] %s\n' "$(ts)" "$*"; }
+err()  { printf '[release %s][ERROR] %s\n' "$(ts)" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+step() { printf '[release %s]   → %s\n' "$(ts)" "$*"; }
+
+banner() {
+  local title="$1"
+  local line
+  line="$(printf '%0.s=' {1..72})"
+  printf '\n'
+  printf '%s\n' "$line"
+  printf '  %s\n' "$title"
+  printf '%s\n' "$line"
+}
+
+server_banner() {
+  local idx="$1" total="$2" host="$3"
+  local line
+  line="$(printf '%0.s#' {1..72})"
+  printf '\n'
+  printf '%s\n' "$line"
+  printf '#  [%d/%d] SERVIDOR: %s\n' "$idx" "$total" "$host"
+  printf '#  hora: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf '%s\n' "$line"
+}
+
+# version_ge <a> <b> → 0 si a >= b, 1 si no. Usa sort -V (GNU sort).
+version_ge() {
+  [[ "$1" == "$2" ]] && return 0
+  local smaller
+  smaller="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)"
+  [[ "$smaller" == "$2" ]]
+}
+
+# ---------- Dependencias ----------
+for cmd in git rsync ssh python3 awk sort mktemp dirname basename nl wc tr; do
+  command -v "$cmd" >/dev/null 2>&1 || die "Falta dependencia: $cmd"
+done
+
+# ---------- Repo ----------
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[[ -n "$REPO_ROOT" ]] || die "No se encuentra repositorio git"
+cd "$REPO_ROOT"
+
+# Validar DEPTH: entero positivo
+[[ "$DEPTH" =~ ^[1-9][0-9]*$ ]] \
+  || die "COMMITSDEPTH debe ser un entero positivo, recibido: '$DEPTH'"
+
+if ! git rev-parse --verify "HEAD~${DEPTH}^{commit}" >/dev/null 2>&1; then
+  die "Historial insuficiente para HEAD~${DEPTH}. En actions/checkout use fetch-depth: 0 (o >= $((DEPTH + 1)))"
+fi
+
+BASE_COMMIT="$(git rev-parse "HEAD~${DEPTH}")"
+HEAD_COMMIT="$(git rev-parse HEAD)"
+
+# ---------- Selección de servidores por argumento ----------
+# El primer argumento posicional define el ambiente de destino. El workflow
+# de GitHub Actions mapea rama → argumento. La rama git se conserva solo
+# como metadato informativo en los logs.
+TARGET="${1:-}"
+[[ -n "$TARGET" ]] || die "Falta argumento de ambiente. Uso: release.sh <develop>"
+
+BRANCH="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')}"
+
+SERVERS=()
+ENV_LABEL=""
+case "$TARGET" in
+  develop)
+    ENV_LABEL="DEVELOP"
+    SERVERS=("${DEVELOP_SERVERS[@]+"${DEVELOP_SERVERS[@]}"}")
+    ;;
+  production)
+    ENV_LABEL="PRODUCTION"
+    SERVERS=("${MASTER_SERVERS[@]+"${MASTER_SERVERS[@]}"}")
+    ;;
+  *)
+    die "Ambiente '$TARGET' no reconocido. Válidos: develop | production"
+    ;;
+esac
+
+# ---------- Validar SERVERS ----------
+[[ "${#SERVERS[@]}" -gt 0 ]] || die "Array de servidores para ambiente '$TARGET' está vacío"
+for entry in "${SERVERS[@]}"; do
+  IFS='|' read -r _h _p _u _rp _kv <<< "$entry"
+  [[ -n "${_h:-}" && -n "${_p:-}" && -n "${_u:-}" && -n "${_rp:-}" ]] \
+    || die "Entrada SERVERS inválida: '$entry' (formato: host|port|user|remote_path[|KEY_ENV_VAR])"
+done
+unset _h _p _u _rp _kv
+
+# ---------- Config ignore ----------
+CONFIG_FILE="${RELEASE_CONFIG:-$REPO_ROOT/.vscode/sftp.json}"
+IGNORE_PATTERNS=()
+if [[ -f "$CONFIG_FILE" ]]; then
+  while IFS= read -r pat; do
+    [[ -n "$pat" ]] && IGNORE_PATTERNS+=("$pat")
+  done < <(python3 - "$CONFIG_FILE" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    for item in cfg.get("ignore", []):
+        print(item)
+except Exception as e:
+    sys.stderr.write(f"[release] aviso: no se pudo leer ignore de {sys.argv[1]}: {e}\n")
+PY
+)
+else
+  log "Aviso: $CONFIG_FILE no existe, sin patrones ignore"
+fi
+
+# Merge de exclusiones CI-only
+for pat in "${EXTRA_IGNORE_PATTERNS[@]+"${EXTRA_IGNORE_PATTERNS[@]}"}"; do
+  IGNORE_PATTERNS+=("$pat")
+done
+
+# ---------- Tmp + trap ----------
+TMP_ALL="$(mktemp)"
+TMP_UPLOAD="$(mktemp)"
+TMP_DELETE_RAW="$(mktemp)"
+TMP_DELETE="$(mktemp)"
+TMP_KEY_FILES=()
+cleanup() {
+  rm -f "$TMP_ALL" "$TMP_UPLOAD" "$TMP_DELETE_RAW" "$TMP_DELETE"
+  for f in "${TMP_KEY_FILES[@]+"${TMP_KEY_FILES[@]}"}"; do
+    [[ -n "$f" ]] && rm -f "$f"
+  done
+}
+trap cleanup EXIT
+
+# ---------- Resolver llave SSH por servidor ----------
+resolve_ssh_key() {
+  local key_var="${1:-}"
+  local content path tmp
+
+  if [[ -n "$key_var" ]]; then
+    content="${!key_var:-}"
+    if [[ -n "$content" ]]; then
+      tmp="$(mktemp)"
+      printf '%s\n' "$content" > "$tmp"
+      chmod 600 "$tmp"
+      TMP_KEY_FILES+=("$tmp")
+      printf '%s' "$tmp"
+      return 0
+    fi
+    err "El servidor pide la llave '$key_var' pero la variable está vacía o no existe"
+    return 1
+  fi
+
+  if [[ -n "${SSH_PRIVATE_KEY_PATH:-}" ]]; then
+    path="$SSH_PRIVATE_KEY_PATH"
+    [[ -f "$path" ]] || { err "SSH_PRIVATE_KEY_PATH no existe: $path"; return 1; }
+    printf '%s' "$path"
+    return 0
+  fi
+
+  if [[ -n "${SSH_PRIVATE_KEY:-}" ]]; then
+    tmp="$(mktemp)"
+    printf '%s\n' "$SSH_PRIVATE_KEY" > "$tmp"
+    chmod 600 "$tmp"
+    TMP_KEY_FILES+=("$tmp")
+    printf '%s' "$tmp"
+    return 0
+  fi
+
+  err "No hay llave SSH disponible (ni por servidor ni global SSH_PRIVATE_KEY / SSH_PRIVATE_KEY_PATH)"
+  return 1
+}
+
+# ---------- Archivos del rango ----------
+git diff --name-only --diff-filter=ACMRTUXB "$BASE_COMMIT" "$HEAD_COMMIT" \
+  | awk 'NF' | sort -u > "$TMP_ALL"
+
+matches_ignore() {
+  local file="$1" pattern dir
+  for pattern in "${IGNORE_PATTERNS[@]}"; do
+    if [[ "$pattern" == */ ]]; then
+      dir="${pattern%/}"
+      [[ "$file" == "$dir"/* || "$file" == */"$dir"/* ]] && return 0
+    fi
+    [[ "$file" == $pattern ]] && return 0
+    [[ "$(basename "$file")" == $pattern ]] && return 0
+  done
+  return 1
+}
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  [[ ! -f "$file" ]] && continue
+  matches_ignore "$file" && continue
+  echo "$file" >> "$TMP_UPLOAD"
+done < "$TMP_ALL"
+
+FILE_COUNT=0
+if [[ -s "$TMP_UPLOAD" ]]; then
+  FILE_COUNT="$(wc -l < "$TMP_UPLOAD" | tr -d ' ')"
+fi
+
+# ---------- Archivos eliminados del rango ----------
+git diff --no-renames --name-only --diff-filter=D "$BASE_COMMIT" "$HEAD_COMMIT" \
+  | awk 'NF' | sort -u > "$TMP_DELETE_RAW"
+
+is_safe_relpath() {
+  local p="$1"
+  [[ -z "$p" ]] && return 1
+  [[ "$p" == /* ]] && return 1
+  [[ "$p" == *..* ]] && return 1
+  [[ "$p" == .git/* ]] && return 1
+  return 0
+}
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  matches_ignore "$file" && continue
+  is_safe_relpath "$file" || { err "Path inseguro en delete list, descartado: $file"; continue; }
+  echo "$file" >> "$TMP_DELETE"
+done < "$TMP_DELETE_RAW"
+
+DELETE_COUNT=0
+if [[ -s "$TMP_DELETE" ]]; then
+  DELETE_COUNT="$(wc -l < "$TMP_DELETE" | tr -d ' ')"
+fi
+
+# ---------- Header ----------
+banner "RELEASE [$ENV_LABEL] — target '$TARGET' (rama '${BRANCH:-?}')"
+log "Target         : $TARGET"
+log "Branch         : ${BRANCH:-<desconocida>}"
+log "Environment    : $ENV_LABEL"
+log "Server count   : ${#SERVERS[@]}"
+for entry in "${SERVERS[@]}"; do
+  IFS='|' read -r _h _p _u _rp _kv <<< "$entry"
+  log "  - $_u@$_h:$_p -> $_rp (key: ${_kv:-<global>})"
+done
+unset _h _p _u _rp _kv
+log "Depth          : $DEPTH (HEAD~${DEPTH}..HEAD) [$DEPTH_SOURCE]"
+log "Base commit    : $BASE_COMMIT"
+log "Head commit    : $HEAD_COMMIT"
+log "Config ignore  : $CONFIG_FILE"
+log "Ignore count   : ${#IGNORE_PATTERNS[@]}"
+log "Archivos subir : $FILE_COUNT"
+log "Archivos borrar: $DELETE_COUNT"
+
+if [[ "$FILE_COUNT" -eq 0 && "$DELETE_COUNT" -eq 0 ]]; then
+  log "No hay archivos para desplegar ni eliminar."
   exit 0
 fi
 
-NOTES_FILE="$(release_notes_file "$TARGET_STABLE_VERSION")"
-
-require_clean_worktree
-require_npm_publish_auth "$dry_run"
-
-if [ "$channel" = "stable" ] && [ ! -f "$NOTES_FILE" ]; then
-  release_fail "stable release notes file is required at $NOTES_FILE before publishing stable."
+if [[ "$FILE_COUNT" -gt 0 ]]; then
+  log "Lista de archivos a subir:"
+  nl -ba "$TMP_UPLOAD" | sed 's/^/  /'
+fi
+if [[ "$DELETE_COUNT" -gt 0 ]]; then
+  log "Lista de archivos a eliminar:"
+  nl -ba "$TMP_DELETE" | sed 's/^/  /'
 fi
 
-if [ "$channel" = "canary" ] && [ -f "$NOTES_FILE" ]; then
-  release_info "  ✓ Stable release notes already exist at $NOTES_FILE"
-fi
+# ---------- Deploy por servidor ----------
+deploy_server() {
+  local idx="$1" total="$2" entry="$3"
+  local host port user remote_path key_var
+  IFS='|' read -r host port user remote_path key_var <<< "$entry"
 
-if git_local_tag_exists "$tag_name" || git_remote_tag_exists "$tag_name" "$PUBLISH_REMOTE"; then
-  release_fail "git tag $tag_name already exists locally or on $PUBLISH_REMOTE."
-fi
+  server_banner "$idx" "$total" "$host"
 
-while IFS= read -r package_name; do
-  [ -z "$package_name" ] && continue
-  if npm_package_version_exists "$package_name" "$TARGET_PUBLISH_VERSION"; then
-    release_fail "npm version ${package_name}@${TARGET_PUBLISH_VERSION} already exists."
+  step "Paso 1/6: resolviendo llave SSH (${key_var:-<global>})"
+  local key_file
+  key_file="$(resolve_ssh_key "${key_var:-}")" \
+    || die "[$host] No se pudo resolver llave SSH"
+  step "        llave lista: $key_file"
+
+  step "Paso 2/6: validando conectividad y detectando versión de rsync remoto"
+  local remote_probe
+  if ! remote_probe="$(ssh -i "$key_file" -p "$port" \
+        -o StrictHostKeyChecking=accept-new \
+        -o BatchMode=yes \
+        -o ConnectTimeout=10 \
+        "$user@$host" \
+        'rsync --version 2>&1 | head -n1' \
+        2>&1)"; then
+    die "[$host] No se pudo conectar por SSH (revisar host/puerto/llave/permisos)"
   fi
-done <<< "$(printf '%s\n' "${PUBLIC_PACKAGE_NAMES[@]}")"
+  step "        conexión OK"
 
-release_info ""
-release_info "==> Release plan"
-release_info "  Remote: $PUBLISH_REMOTE"
-release_info "  Channel: $channel"
-release_info "  Current branch: ${CURRENT_BRANCH:-<detached>}"
-release_info "  Source commit: $CURRENT_SHA"
-release_info "  Last stable tag: ${LAST_STABLE_TAG:-<none>}"
-release_info "  Current stable version: $CURRENT_STABLE_VERSION"
-release_info "  Release date (UTC): $RELEASE_DATE"
-release_info "  Target stable version: $TARGET_STABLE_VERSION"
-if [ "$channel" = "canary" ]; then
-  release_info "  Canary version: $TARGET_PUBLISH_VERSION"
+  local remote_rsync_ver
+  remote_rsync_ver="$(printf '%s' "$remote_probe" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+  if [[ -z "$remote_rsync_ver" ]]; then
+    err "[$host] No se pudo detectar la versión de rsync remoto (salida: $remote_probe)"
+  elif version_ge "$remote_rsync_ver" "$MIN_RSYNC_VERSION"; then
+    step "        rsync remoto: $remote_rsync_ver ✔ (>= $MIN_RSYNC_VERSION)"
+  else
+    err "[$host] rsync remoto $remote_rsync_ver < $MIN_RSYNC_VERSION (recomendado)"
+    if [[ "$AUTO_UPDATE_RSYNC" == "1" ]]; then
+      step "        AUTO_UPDATE_RSYNC=1 → intentando actualizar rsync con sudo"
+      local update_script='
+set -e
+if command -v dnf >/dev/null 2>&1; then
+  sudo -n dnf install -y rsync
+elif command -v yum >/dev/null 2>&1; then
+  sudo -n yum install -y rsync
+elif command -v apt-get >/dev/null 2>&1; then
+  sudo -n apt-get update -qq && sudo -n apt-get install -y rsync
 else
-  release_info "  Stable version: $TARGET_PUBLISH_VERSION"
+  echo "NO_PKG_MANAGER" >&2
+  exit 1
 fi
-release_info "  Dist-tag: $DIST_TAG"
-release_info "  Git tag: $tag_name"
-if [ "$channel" = "stable" ]; then
-  release_info "  Release notes: $NOTES_FILE"
-fi
+rsync --version 2>&1 | head -n1
+'
+      local update_out
+      if update_out="$(ssh -i "$key_file" -p "$port" \
+              -o StrictHostKeyChecking=accept-new \
+              -o BatchMode=yes \
+              "$user@$host" "$update_script" 2>&1)"; then
+        local new_ver
+        new_ver="$(printf '%s' "$update_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+        step "        rsync actualizado a ${new_ver:-?}"
+      else
+        err "[$host] No se pudo actualizar rsync (sudo sin password / sin red / sin repos)"
+        step "        continuando con rsync viejo"
+      fi
+    fi
+  fi
 
-set_cleanup_trap
+  step "Paso 3/6: preparando parámetros de despliegue"
+  step "        host   : $host"
+  step "        user   : $user"
+  step "        port   : $port"
+  step "        remote : $remote_path"
+  step "        key    : ${key_var:-<global>}"
+  step "        subir  : $FILE_COUNT"
+  step "        borrar : $DELETE_COUNT"
 
-if [ "$skip_verify" = false ]; then
-  release_info ""
-  release_info "==> Step 1/7: Verification gate..."
-  cd "$REPO_ROOT"
-  pnpm -r typecheck
-  pnpm test:run
-  pnpm build
-else
-  release_info ""
-  release_info "==> Step 1/7: Verification gate skipped (--skip-verify)"
-fi
+  step "Paso 4/6: ejecutando rsync (modo atómico: --delay-updates)"
+  local ssh_cmd="ssh -i $key_file -p $port -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+  local start_ts end_ts
+  start_ts="$(date +%s)"
+  if [[ "$FILE_COUNT" -gt 0 ]]; then
+    local dirs_list
+    dirs_list="$(awk -F/ 'NF>1{$NF=""; sub(/\/$/, ""); print}' OFS=/ "$TMP_UPLOAD" | sort -u)"
+    if [[ -n "$dirs_list" ]]; then
+      local mkdir_cmd=""
+      while IFS= read -r d; do
+        mkdir_cmd="${mkdir_cmd}sudo mkdir -p '${remote_path}/${d}' && sudo chown ${user}:${user} '${remote_path}/${d}' ; "
+      done <<< "$dirs_list"
+      ssh -i "$key_file" -p "$port" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+        "$user@$host" "bash -c '${mkdir_cmd} true'" 2>/dev/null || true
+    fi
 
-release_info ""
-release_info "==> Step 2/7: Building workspace artifacts..."
-cd "$REPO_ROOT"
-pnpm build
-node "$REPO_ROOT/scripts/build-standalone-public-packages.mjs"
-bash "$REPO_ROOT/scripts/prepare-server-ui-dist.sh"
-for pkg_dir in server packages/adapters/claude-local packages/adapters/codex-local; do
-  rm -rf "$REPO_ROOT/$pkg_dir/skills"
-  cp -r "$REPO_ROOT/skills" "$REPO_ROOT/$pkg_dir/skills"
+    rsync -rvz --omit-dir-times --no-perms --no-owner --no-group --chmod=a=rwx \
+      --delay-updates \
+      --files-from="$TMP_UPLOAD" \
+      -e "$ssh_cmd" \
+      "$REPO_ROOT/" "$user@$host:$remote_path/"
+  else
+    step "        nada para subir (solo deletes en este rango)"
+  fi
+  end_ts="$(date +%s)"
+
+  step "Paso 5/6: eliminando archivos removidos en el rango"
+  if [[ "$DELETE_COUNT" -eq 0 ]]; then
+    step "        nada que eliminar"
+  else
+    step "        $DELETE_COUNT archivo(s) a eliminar"
+    if ! ( while IFS= read -r _rel; do
+             [[ -n "$_rel" ]] && printf '%s\0' "$remote_path/$_rel"
+           done < "$TMP_DELETE" ) \
+         | ssh -i "$key_file" -p "$port" \
+             -o StrictHostKeyChecking=accept-new \
+             -o BatchMode=yes \
+             "$user@$host" 'xargs -0 -r rm -f --'; then
+      err "[$host] Aviso: algunos archivos no se pudieron eliminar (permisos o ya borrados)"
+    fi
+    step "        eliminación OK"
+  fi
+
+  step "Paso 6/6: finalizado ($((end_ts - start_ts))s)"
+  log "[$host] ✔ OK"
+}
+
+TOTAL_SERVERS="${#SERVERS[@]}"
+IDX=0
+for entry in "${SERVERS[@]}"; do
+  IDX=$((IDX + 1))
+  deploy_server "$IDX" "$TOTAL_SERVERS" "$entry"
 done
-release_info "  ✓ Workspace build complete"
 
-release_info ""
-release_info "==> Step 3/7: Rewriting workspace versions..."
-set_public_package_version "$TARGET_PUBLISH_VERSION"
-release_info "  ✓ Versioned workspace to $TARGET_PUBLISH_VERSION"
-
-release_info ""
-release_info "==> Step 4/7: Building publishable CLI bundle..."
-"$REPO_ROOT/scripts/build-npm.sh" --skip-checks --skip-typecheck
-release_info "  ✓ CLI bundle ready"
-
-VERSIONED_PACKAGE_INFO="$(list_public_package_info)"
-VERSION_IN_CLI_PACKAGE="$(node -e "console.log(require('$CLI_DIR/package.json').version)")"
-if [ "$VERSION_IN_CLI_PACKAGE" != "$TARGET_PUBLISH_VERSION" ]; then
-  release_fail "versioning drift detected. Expected $TARGET_PUBLISH_VERSION but found $VERSION_IN_CLI_PACKAGE."
-fi
-
-release_info ""
-if [ "$dry_run" = true ]; then
-  release_info "==> Step 5/7: Previewing publish payloads (--dry-run)..."
-  while IFS=$'\t' read -r pkg_dir _pkg_name _pkg_version; do
-    [ -z "$pkg_dir" ] && continue
-    release_info "  --- $pkg_dir ---"
-    cd "$REPO_ROOT/$pkg_dir"
-    pnpm publish --dry-run --no-git-checks --tag "$DIST_TAG" 2>&1 | tail -3
-  done <<< "$VERSIONED_PACKAGE_INFO"
-  release_info "  [dry-run] Would create git tag $tag_name on $CURRENT_SHA"
-else
-  release_info "==> Step 5/7: Publishing packages to npm..."
-  while IFS=$'\t' read -r pkg_dir pkg_name pkg_version; do
-    [ -z "$pkg_dir" ] && continue
-    release_info "  Publishing $pkg_name@$pkg_version"
-    cd "$REPO_ROOT/$pkg_dir"
-    pnpm publish --no-git-checks --tag "$DIST_TAG" --access public
-  done <<< "$VERSIONED_PACKAGE_INFO"
-  release_info "  ✓ Published all packages under dist-tag $DIST_TAG"
-fi
-
-release_info ""
-if [ "$dry_run" = true ]; then
-  release_info "==> Step 6/7: Skipping npm verification in dry-run mode..."
-else
-  release_info "==> Step 6/7: Confirming npm package availability and dist-tag integrity..."
-  VERIFY_ATTEMPTS="${NPM_PUBLISH_VERIFY_ATTEMPTS:-12}"
-  VERIFY_DELAY_SECONDS="${NPM_PUBLISH_VERIFY_DELAY_SECONDS:-5}"
-  REGISTRY_STATE_VERIFY_ATTEMPTS="${NPM_REGISTRY_STATE_VERIFY_ATTEMPTS:-12}"
-  REGISTRY_STATE_VERIFY_DELAY_SECONDS="${NPM_REGISTRY_STATE_VERIFY_DELAY_SECONDS:-5}"
-  MISSING_PUBLISHED_PACKAGES=""
-
-  while IFS=$'\t' read -r _pkg_dir pkg_name pkg_version; do
-    [ -z "$pkg_name" ] && continue
-    release_info "  Checking $pkg_name@$pkg_version"
-    if wait_for_npm_package_version "$pkg_name" "$pkg_version" "$VERIFY_ATTEMPTS" "$VERIFY_DELAY_SECONDS"; then
-      release_info "    ✓ Found on npm"
-      continue
-    fi
-
-    if [ -n "$MISSING_PUBLISHED_PACKAGES" ]; then
-      MISSING_PUBLISHED_PACKAGES="${MISSING_PUBLISHED_PACKAGES}, "
-    fi
-    MISSING_PUBLISHED_PACKAGES="${MISSING_PUBLISHED_PACKAGES}${pkg_name}@${pkg_version}"
-  done <<< "$VERSIONED_PACKAGE_INFO"
-
-  [ -z "$MISSING_PUBLISHED_PACKAGES" ] || release_fail "publish completed but npm never exposed: $MISSING_PUBLISHED_PACKAGES"
-
-  release_info "  ✓ Verified all versioned packages are available on npm"
-
-  verify_args=(
-    --channel "$channel"
-    --dist-tag "$DIST_TAG"
-    --target-version "$TARGET_PUBLISH_VERSION"
-  )
-  while IFS=$'\t' read -r _pkg_dir pkg_name _pkg_version; do
-    [ -z "$pkg_name" ] && continue
-    verify_args+=(--package "$pkg_name")
-  done <<< "$VERSIONED_PACKAGE_INFO"
-
-  release_info "  Waiting for npm dist-tags and package metadata to converge..."
-  if wait_for_release_registry_state \
-    "$REGISTRY_STATE_VERIFY_ATTEMPTS" \
-    "$REGISTRY_STATE_VERIFY_DELAY_SECONDS" \
-    "${verify_args[@]}"; then
-    :
-  else
-    verify_status=$?
-    if [ "$verify_status" -eq 2 ]; then
-      release_fail "publish completed, but registry verification failed immediately for ${TARGET_PUBLISH_VERSION}; dist-tag state is wrong or requires operator intervention"
-    fi
-
-    release_fail "publish completed, but npm dist-tags or registry metadata never converged for ${TARGET_PUBLISH_VERSION}"
-  fi
-fi
-
-release_info ""
-if [ "$dry_run" = true ]; then
-  release_info "==> Step 7/7: Dry run complete..."
-else
-  release_info "==> Step 7/7: Creating git tag..."
-  git -C "$REPO_ROOT" tag "$tag_name" "$CURRENT_SHA"
-  release_info "  ✓ Created tag $tag_name on $CURRENT_SHA"
-fi
-
-release_info ""
-if [ "$dry_run" = true ]; then
-  release_info "Dry run complete for $channel ${TARGET_PUBLISH_VERSION}."
-else
-  if [ "$channel" = "canary" ]; then
-    release_info "Published canary ${TARGET_PUBLISH_VERSION}."
-    release_info "Install with: npx paperclipai@canary onboard"
-    release_info "Next step: git push ${PUBLISH_REMOTE} refs/tags/${tag_name}"
-  else
-    release_info "Published stable ${TARGET_PUBLISH_VERSION}."
-    release_info "Next steps:"
-    release_info "  git push ${PUBLISH_REMOTE} refs/tags/${tag_name}"
-    release_info "  ./scripts/create-github-release.sh $TARGET_STABLE_VERSION"
-  fi
-fi
+banner "RELEASE [$ENV_LABEL] COMPLETADO — $TOTAL_SERVERS srv, $FILE_COUNT sub, $DELETE_COUNT del"
